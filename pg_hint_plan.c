@@ -4715,7 +4715,7 @@ pg_hint_plan_set_rel_pathlist(PlannerInfo * root, RelOptInfo *rel,
 		{
 			ListCell *lcp;
 			AppendPath *apath = (AppendPath *) lfirst(lc);
-			int		parallel_workers = 0;
+			int		parallel_workers = apath->path.parallel_workers;
 
 			if (!IsA(apath, AppendPath))
 				continue;
@@ -4724,8 +4724,7 @@ pg_hint_plan_set_rel_pathlist(PlannerInfo * root, RelOptInfo *rel,
 			{
 				Path *spath = (Path *) lfirst(lcp);
 
-				if (spath->parallel_aware &&
-					parallel_workers < spath->parallel_workers)
+				if (parallel_workers < spath->parallel_workers)
 					parallel_workers = spath->parallel_workers;
 			}
 
