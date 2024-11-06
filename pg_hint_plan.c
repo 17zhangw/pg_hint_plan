@@ -3410,9 +3410,18 @@ restrict_indexes(PlannerInfo *root, ScanMethodHint *hint, RelOptInfo *rel,
 	foreach (cell, rel->indexlist)
 	{
 		IndexOptInfo   *info = (IndexOptInfo *) lfirst(cell);
-		char		   *indexname = get_rel_name(info->indexoid);
 		ListCell	   *l;
 		bool			use_index = false;
+        // https://github.com/ossc-db/pg_hint_plan/issues/205
+		// char		   *indexname = get_rel_name(info->indexoid);
+        char           *indexname = explain_get_index_name_hook(info->indexoid);
+        if (indexname == NULL) {
+                indexname = get_rel_name(info->indexoid);
+        }
+        else
+        {
+                indexname = pstrdup(indexname);
+        }
 
 		foreach(l, hint->indexnames)
 		{
