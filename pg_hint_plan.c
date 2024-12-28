@@ -96,6 +96,7 @@ PG_MODULE_MAGIC;
 #define HINT_ROWS				"Rows"
 #define HINT_MEMOIZE			"Memoize"
 #define HINT_NOMEMOIZE			"NoMemoize"
+#define HINT_MATERIALIZE		"Materialize"
 
 #define HINT_ARRAY_DEFAULT_INITSIZE 8
 
@@ -165,6 +166,7 @@ typedef enum HintKeyword
 	HINT_KEYWORD_PARALLEL,
 	HINT_KEYWORD_MEMOIZE,
 	HINT_KEYWORD_NOMEMOIZE,
+	HINT_KEYWORD_MATERIALIZE,
 
 	HINT_KEYWORD_UNRECOGNIZED
 } HintKeyword;
@@ -200,6 +202,7 @@ typedef enum HintType
 	HINT_TYPE_ROWS,
 	HINT_TYPE_PARALLEL,
 	HINT_TYPE_MEMOIZE,
+	HINT_TYPE_MATERIALIZE,
 
 	NUM_HINT_TYPE
 } HintType;
@@ -217,7 +220,8 @@ static const char *HintTypeName[] = {
 	"set",
 	"rows",
 	"parallel",
-	"memoize"
+	"memoize",
+	"materialize",
 };
 
 StaticAssertDecl(sizeof(HintTypeName) / sizeof(char *) == NUM_HINT_TYPE,
@@ -324,6 +328,14 @@ typedef struct SetHint
 	List   *words;
 } SetHint;
 
+typedef struct MaterializeHint
+{
+	Hint	base;
+	char   *ctename;
+	CTEMaterialize value;
+	List   *words;
+} MaterializeHint;
+
 /* rows hints */
 typedef enum RowsValueType {
 	RVT_ABSOLUTE,		/* Rows(... #1000) */
@@ -398,6 +410,7 @@ struct HintState
 	RowsHint	  **rows_hints;			/* parsed Rows hints */
 	ParallelHint  **parallel_hints;		/* parsed Parallel hints */
 	JoinMethodHint **memoize_hints;		/* parsed Memoize hints */
+	MaterializeHint **materialize_hints;
 };
 
 /*
@@ -463,6 +476,15 @@ static void SetHintDelete(SetHint *hint);
 static void SetHintDesc(SetHint *hint, StringInfo buf, bool nolf);
 static int SetHintCmp(const SetHint *a, const SetHint *b);
 static const char *SetHintParse(SetHint *hint, HintState *hstate, Query *parse,
+								const char *str);
+
+/* Materialize hint callbacks */
+static Hint *MaterializeHintCreate(const char *hint_str, const char *keyword,
+						   HintKeyword hint_keyword);
+static void MaterializeHintDelete(MaterializeHint *hint);
+static void MaterializeHintDesc(MaterializeHint *hint, StringInfo buf, bool nolf);
+static int MaterializeHintCmp(const MaterializeHint *a, const MaterializeHint *b);
+static const char *MaterializeHintParse(MaterializeHint *hint, HintState *hstate, Query *parse,
 								const char *str);
 
 /* Rows hint callbacks */
@@ -627,6 +649,7 @@ static const HintParser parsers[] = {
 	{HINT_PARALLEL, ParallelHintCreate, HINT_KEYWORD_PARALLEL},
 	{HINT_MEMOIZE, MemoizeHintCreate, HINT_KEYWORD_MEMOIZE},
 	{HINT_NOMEMOIZE, MemoizeHintCreate, HINT_KEYWORD_NOMEMOIZE},
+	{HINT_MATERIALIZE, MaterializeHintCreate, HINT_KEYWORD_MATERIALIZE},
 
 	{NULL, NULL, HINT_KEYWORD_UNRECOGNIZED}
 };
@@ -903,6 +926,62 @@ LeadingHintDelete(LeadingHint *hint)
 }
 
 static Hint *
+MaterializeHintCreate(const char *hint_str, const char *keyword,
+			  HintKeyword hint_keyword)
+{
+	MaterializeHint	   *hint;
+
+	hint = palloc(sizeof(MaterializeHint));
+	hint->base.hint_str = hint_str;
+	hint->base.keyword = keyword;
+	hint->base.hint_keyword = hint_keyword;
+	hint->base.type = HINT_TYPE_MATERIALIZE;
+	hint->base.state = HINT_STATE_NOTUSED;
+	hint->base.delete_func = (HintDeleteFunction) MaterializeHintDelete;
+	hint->base.desc_func = (HintDescFunction) MaterializeHintDesc;
+	hint->base.cmp_func = (HintCmpFunction) MaterializeHintCmp;
+	hint->base.parse_func = (HintParseFunction) MaterializeHintParse;
+	hint->ctename = NULL;
+	hint->value = CTEMaterializeDefault;
+	return (Hint *) hint;
+}
+
+static void
+MaterializeHintDelete(MaterializeHint *hint)
+{
+	if (!hint)
+		return;
+
+	if (hint->ctename)
+		pfree(hint->ctename);
+	if (hint->words)
+		list_free(hint->words);
+	pfree(hint);
+}
+
+static void
+MaterializeHintDesc(MaterializeHint *hint, StringInfo buf, bool nolf)
+{
+	appendStringInfo(buf, "%s(", HINT_MATERIALIZE);
+	quote_value(buf, hint->ctename);
+	if (hint->value == CTEMaterializeAlways)
+		appendStringInfo(buf, " MATERIALIZE");
+	else if (hint->value == CTEMaterializeNever)
+		appendStringInfo(buf, " INLINE");
+	else
+		appendStringInfo(buf, " DEFAULT");
+	appendStringInfo(buf, ")");
+	if (!nolf)
+		appendStringInfoChar(buf, '\n');
+}
+
+static int
+MaterializeHintCmp(const MaterializeHint *a, const MaterializeHint *b)
+{
+	return strcmp(a->ctename, b->ctename);
+}
+
+static Hint *
 SetHintCreate(const char *hint_str, const char *keyword,
 			  HintKeyword hint_keyword)
 {
@@ -1070,6 +1149,7 @@ HintStateCreate(void)
 	hstate->leading_hint = NULL;
 	hstate->context = superuser() ? PGC_SUSET : PGC_USERSET;
 	hstate->set_hints = NULL;
+	hstate->materialize_hints = NULL;
 	hstate->rows_hints = NULL;
 	hstate->parallel_hints = NULL;
 
@@ -2050,6 +2130,7 @@ create_hintstate(Query *parse, const char *hints)
 		hstate->num_hints[HINT_TYPE_ROWS]);
 	hstate->memoize_hints = (JoinMethodHint **) (hstate->parallel_hints +
 		hstate->num_hints[HINT_TYPE_PARALLEL]);
+	hstate->materialize_hints = (MaterializeHint **) (hstate->memoize_hints + hstate->num_hints[HINT_TYPE_MEMOIZE]);
 
 	return hstate;
 }
@@ -2337,6 +2418,45 @@ SetHintParse(SetHint *hint, HintState *hstate, Query *parse, const char *str)
 
 	return str;
 }
+
+static const char *
+MaterializeHintParse(MaterializeHint *hint, HintState *hstate, Query *parse, const char *str)
+{
+	List   *name_list = NIL;
+
+	if ((str = parse_parentheses(str, &name_list, hint->base.hint_keyword)) == NULL)
+		return NULL;
+
+	hint->words = name_list;
+
+	/* We need both name and value to set GUC parameter. */
+	if (list_length(name_list) == 2)
+	{
+		if (strcasecmp(lsecond(name_list), "materialize") != 0 && strcasecmp(lsecond(name_list), "inline") != 0)
+		{
+			hint_ereport(hint->base.hint_str,
+						 ("%s hint requires CTE name and materialize/inline.",
+						  HINT_MATERIALIZE));
+			hint->base.state = HINT_STATE_ERROR;
+		}
+		else
+		{
+			bool materialize = strcasecmp(lsecond(name_list), "materialize") == 0;
+			hint->ctename = linitial(name_list);
+			hint->value = materialize ? CTEMaterializeAlways : CTEMaterializeNever;
+		}
+	}
+	else
+	{
+		hint_ereport(hint->base.hint_str,
+					 ("%s hint requires CTE name and materialize/inline.",
+					  HINT_MATERIALIZE));
+		hint->base.state = HINT_STATE_ERROR;
+	}
+
+	return str;
+}
+
 
 static const char *
 RowsHintParse(RowsHint *hint, HintState *hstate, Query *parse,
@@ -3090,6 +3210,25 @@ pg_hint_plan_planner(Query *parse, const char *query_string, int cursorOptions, 
 		min_parallel_index_scan_size;
 	current_hint_state->init_paratup_cost = parallel_tuple_cost;
 	current_hint_state->init_parasetup_cost = parallel_setup_cost;
+
+	// Attach CTE Materialize hints...
+	if (parse->cteList != NIL)
+	{
+		ListCell *cc;
+		foreach (cc, parse->cteList)
+		{
+			int i;
+			CommonTableExpr* cte = (CommonTableExpr*)lfirst(cc);
+			for (i = 0; i < current_hint_state->num_hints[HINT_TYPE_MATERIALIZE]; i++)
+			{
+				MaterializeHint* hint = current_hint_state->materialize_hints[i];
+				if (hint->ctename && strcmp(hint->ctename, cte->ctename) == 0)
+				{
+					cte->ctematerialized = hint->value;
+				}
+			}
+		}
+	}
 
 	/*
 	 * max_parallel_workers_per_gather should be non-zero here if Workers hint
